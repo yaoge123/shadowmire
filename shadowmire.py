@@ -40,6 +40,16 @@ USER_AGENT = "Shadowmire (https://github.com/taoky/shadowmire)"
 LOCAL_DB_NAME = "local.db"
 LOCAL_JSON_NAME = "local.json"
 LOCAL_DB_SERIAL_NAME = "local.db.serial"
+BIND_ADDRESS = os.environ.get("BIND_ADDRESS")
+if BIND_ADDRESS:
+    import urllib3
+    real_create_conn = urllib3.util.connection.create_connection
+
+    def set_src_addr(address, timeout, *args, **kw):
+        source_address = (BIND_ADDRESS, 0)
+        return real_create_conn(address, timeout=timeout, source_address=source_address)
+    
+    urllib3.util.connection.create_connection = set_src_addr
 
 # Note that it's suggested to use only 3 workers for PyPI.
 WORKERS = int(os.environ.get("SHADOWMIRE_WORKERS", "3"))
