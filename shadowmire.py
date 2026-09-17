@@ -1085,6 +1085,10 @@ class SyncBase:
         Returns if skip this package or not.
         """
         try:
+            if len(dest.name.encode('utf-8')) > 240:
+                # PyPI tolerates packages with very long version or name,
+                # but WE DON'T!
+                return True
             if has_metadata:
                 m_dest = dest.with_name(dest.name + ".metadata")
                 if not m_dest.exists():
