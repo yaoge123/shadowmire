@@ -103,6 +103,24 @@ def exit_with_futures(futures: dict[Future[Any], Any]) -> NoReturn:
     os._exit(1)
 
 
+def as_completed_with_stop(
+    futures: dict[Future[Any], Any], on_stop: Optional[Callable[[], Any]] = None
+) -> Generator[Future[Any], None, None]:
+    """as_completed() that exits promptly once a stop is requested.
+
+    Polls the stop flag as each future completes. On stop, on_stop runs
+    first (e.g. local_db.dump_json, since earlier steps may already have
+    committed changes), then pending futures are cancelled and the process
+    exits without waiting for in-flight ones (see exit_with_futures).
+    """
+    for future in as_completed(futures):
+        if stop_requested:
+            if on_stop is not None:
+                on_stop()
+            exit_with_futures(futures)
+        yield future
+
+
 class LocalVersionKV:
     """
     A key-value database wrapper over sqlite3.
@@ -919,12 +937,10 @@ class SyncBase:
             }
             try:
                 for future in tqdm(
-                    as_completed(futures),
+                    as_completed_with_stop(futures),
                     total=len(package_names),
                     desc="Checking consistency",
                 ):
-                    if stop_requested:
-                        exit_with_futures(futures)
                     package_name = futures[future]
                     try:
                         consistent = future.result()
@@ -940,6 +956,10 @@ class SyncBase:
 
         logger.info("%s packages to update in check_and_update()", len(to_update))
         return self.parallel_update(to_update, file_inclusion_checker)
+
+    def _dump_on_stop(self) -> None:
+        logger.info("Termination requested; saving state and cancelling pending downloads")
+        self.local_db.dump_json()
 
     def parallel_update(
         self,
@@ -962,14 +982,10 @@ class SyncBase:
             }
             try:
                 for future in tqdm(
-                    as_completed(futures), total=len(package_names), desc="Updating"
+                    as_completed_with_stop(futures, on_stop=self._dump_on_stop),
+                    total=len(package_names),
+                    desc="Updating",
                 ):
-                    if stop_requested:
-                        logger.info(
-                            "Termination requested; saving state and cancelling pending downloads"
-                        )
-                        self.local_db.dump_json()
-                        exit_with_futures(futures)
                     idx, package_name = futures[future]
                     try:
                         serial = future.result()
@@ -1756,12 +1772,10 @@ def genlocal(ctx: click.Context) -> None:
         }
         try:
             for future in tqdm(
-                as_completed(futures),
+                as_completed_with_stop(futures),
                 total=len(dir_items),
                 desc="Reading packages from json/",
             ):
-                if stop_requested:
-                    exit_with_futures(futures)
                 package_name = futures[future].name
                 try:
                     serial = future.result()
@@ -1884,9 +1898,7 @@ def verify(
             for idx, first_dir in enumerate(fast_iterdir((basedir / "packages"), "dir"))
         }
         try:
-            for future in as_completed(futures):
-                if stop_requested:
-                    exit_with_futures(futures)
+            for future in as_completed_with_stop(futures):
                 sname = futures[future]
                 try:
                     for p in future.result():
@@ -1942,12 +1954,10 @@ def verify(
         }
         try:
             for future in tqdm(
-                as_completed(futures),
+                as_completed_with_stop(futures),
                 total=len(simple_dirs),
                 desc="Iterating simple/ directory",
             ):
-                if stop_requested:
-                    exit_with_futures(futures)
                 sname = futures[future]
                 try:
                     nps = future.result()
