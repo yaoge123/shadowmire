@@ -22,7 +22,7 @@ from ..constants import (
     WORKERS,
 )
 from ..database import LocalVersionKV
-from ..errors import ExitProgramException, exit_with_futures
+from ..errors import exit_with_futures, is_stop_requested
 from ..filesystem import (
     MAX_FILENAME_BYTES,
     ignore_unrepresentable_path,
@@ -181,6 +181,10 @@ class SyncBase:
                         for package_name in batch
                     }
                     for future in as_completed(futures):
+                        if is_stop_requested():
+                            # Planning only reads state, so there is nothing
+                            # to dump; cancel the remaining batch and exit.
+                            exit_with_futures(futures)
                         package_name = futures[future]
                         action = future.result()
                         if action == "remove":
@@ -446,6 +450,10 @@ class SyncBase:
                     total=len(package_names),
                     desc="Checking consistency",
                 ):
+                    if is_stop_requested():
+                        # verify's steps 1-2 may already have committed removals
+                        self.local_db.dump_json()
+                        exit_with_futures(futures)
                     package_name = futures[future]
                     try:
                         consistent = future.result()
@@ -501,6 +509,12 @@ class SyncBase:
                 for future in tqdm(
                     as_completed(futures), total=len(package_names), desc="Updating"
                 ):
+                    if is_stop_requested():
+                        logger.info(
+                            "Termination requested; saving state and cancelling pending downloads"
+                        )
+                        self.local_db.dump_json()
+                        exit_with_futures(futures)
                     idx, package_name = futures[future]
                     try:
                         serial = future.result()
@@ -522,7 +536,7 @@ class SyncBase:
                     if idx % 100 == 0:
                         logger.info("dumping local db...")
                         self.local_db.dump_json()
-            except (ExitProgramException, KeyboardInterrupt):
+            except KeyboardInterrupt:
                 exit_with_futures(futures)
         return success
 
@@ -547,6 +561,12 @@ class SyncBase:
         to_update = plan.update
 
         for package_name in to_remove:
+            if is_stop_requested():
+                logger.info(
+                    "Termination requested during removals; saving state and exiting"
+                )
+                self.local_db.dump_json()
+                sys.exit(1)
             self.do_remove(package_name)
 
         logger.info(
@@ -554,11 +574,24 @@ class SyncBase:
             len(plan.package_remove),
         )
         for package_name in plan.package_remove:
+            if is_stop_requested():
+                logger.info(
+                    "Termination requested during removals; saving state and exiting"
+                )
+                self.local_db.dump_json()
+                sys.exit(1)
             self.remove_package_files(package_name)
             self.local_db.set_file_serial(package_name, PACKAGE_FILES_METADATA_ONLY)
 
         if plan.package_state_update:
             self.local_db.batch_set_file_serials(plan.package_state_update)
+
+        if is_stop_requested():
+            # Also covers the empty `to_update` case, where parallel_update()
+            # would never enter its loop and the flag would go unnoticed.
+            logger.info("Termination requested; saving state and exiting")
+            self.local_db.dump_json()
+            sys.exit(1)
 
         return self.parallel_update(
             to_update, package_inclusion_checker, file_inclusion_checker

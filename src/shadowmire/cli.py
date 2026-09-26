@@ -19,7 +19,7 @@ from tqdm import tqdm
 from . import __version__
 from .constants import IOWORKERS, LOCAL_DB_NAME, LOCAL_JSON_NAME, WORKERS
 from .database import LocalVersionKV
-from .errors import ExitProgramException, exit_with_futures
+from .errors import exit_with_futures, is_stop_requested, request_stop
 from .filesystem import fast_iterdir, fast_readall, overwrite
 from .filters import (
     PACKAGE_FILTER,
@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 
 
 def exit_handler(signum: int, frame: FrameType | None) -> None:
-    raise ExitProgramException
+    # Raising an exception here is unreliable: the main thread is usually
+    # blocked waiting on futures, so it may fire late or not at all. Set a
+    # flag instead; the worker loops exit at the next completed future.
+    request_stop()
 
 
 def get_local_serial(package_meta_direntry: os.DirEntry[str]) -> int | None:
@@ -274,6 +277,8 @@ def sync(
         local_file_serials=local_file_serials,
     )
     plan_json = json.dumps(plan, default=vars, indent=2)
+    if is_stop_requested():
+        sys.exit(1)
     if dry_run:
         click.echo(plan_json)
         return
@@ -284,7 +289,12 @@ def sync(
     success = syncer.do_sync_plan(
         plan, package_inclusion_checker, file_inclusion_checker
     )
+    if is_stop_requested():
+        sys.exit(1)
     syncer.finalize(plan.remote_last_serial)
+    if is_stop_requested():
+        # SIGTERM arrived while finalize() was writing the indexes
+        sys.exit(1)
 
     logger.info("Synchronization finished. Success: %s", success)
 
@@ -313,6 +323,8 @@ def genlocal(ctx: click.Context) -> None:
                 total=len(dir_items),
                 desc="Reading packages from json/",
             ):
+                if is_stop_requested():
+                    exit_with_futures(futures)
                 package_name = futures[future].name
                 try:
                     serial = future.result()
@@ -324,11 +336,15 @@ def genlocal(ctx: click.Context) -> None:
                     logger.warning(
                         "%s generated an exception", package_name, exc_info=True
                     )
-        except (ExitProgramException, KeyboardInterrupt):
+        except KeyboardInterrupt:
             exit_with_futures(futures)
     logger.info(
         "%d out of %d packages have valid serial number", len(local), len(dir_items)
     )
+    if is_stop_requested():
+        # Do not start the destructive rebuild after a termination request
+        logger.info("Termination requested; exiting")
+        sys.exit(1)
     local_db.nuke(commit=False)
     local_db.batch_set(local)
     local_db.dump_json()
@@ -374,6 +390,11 @@ def verify(
         len(local_names),
     )
     for package_name in not_in_local:
+        if is_stop_requested():
+            # Step 1 removals commit SQLite; keep downstream local.json in sync
+            logger.info("Termination requested; saving state and exiting")
+            local_db.dump_json()
+            sys.exit(1)
         logger.info("package %s not in local db", package_name)
         if remove_not_in_local:
             # Old bandersnatch would download packages without normalization,
@@ -391,6 +412,11 @@ def verify(
         len(plan.remove),
     )
     for package_name in plan.remove:
+        if is_stop_requested():
+            # Step 2 removals commit SQLite; keep downstream local.json in sync
+            logger.info("Termination requested; saving state and exiting")
+            local_db.dump_json()
+            sys.exit(1)
         # We only take the plan.remove part here
         logger.info("package %s not in remote index", package_name)
         syncer.do_remove(package_name, remove_packages=False)
@@ -422,6 +448,10 @@ def verify(
         }
         try:
             for future in as_completed(futures):
+                if is_stop_requested():
+                    # Steps 1-2 may already have committed removals
+                    local_db.dump_json()
+                    exit_with_futures(futures)
                 sname = futures[future]
                 try:
                     for p in future.result():
@@ -431,7 +461,7 @@ def verify(
                         raise
                     logger.warning("%s generated an exception", sname, exc_info=True)
                     success = False
-        except (ExitProgramException, KeyboardInterrupt):
+        except KeyboardInterrupt:
             exit_with_futures(futures)
 
     logger.info(
@@ -445,7 +475,15 @@ def verify(
         packages_pathcache,
         compare_size,
     )
+    if is_stop_requested():
+        # Do not finalize after a termination request
+        logger.info("Termination requested; saving state and exiting")
+        local_db.dump_json()
+        sys.exit(1)
     syncer.finalize(plan.remote_last_serial)
+    if is_stop_requested():
+        # SIGTERM arrived while finalize() was writing the indexes
+        sys.exit(1)
 
     logger.info(
         "====== Step 5. Remove any unreferenced files in `packages` folder ======"
@@ -482,6 +520,10 @@ def verify(
                 total=len(simple_dirs),
                 desc="Iterating simple/ directory",
             ):
+                if is_stop_requested():
+                    # Steps 1-2 may already have committed removals
+                    local_db.dump_json()
+                    exit_with_futures(futures)
                 sname = futures[future]
                 try:
                     nps = future.result()
@@ -492,14 +534,22 @@ def verify(
                         raise
                     logger.warning("%s generated an exception", sname, exc_info=True)
                     success = False
-        except (ExitProgramException, KeyboardInterrupt):
+        except KeyboardInterrupt:
             exit_with_futures(futures)
 
         # Part 2: handling packages
         for path in tqdm(packages_pathcache, desc="Iterating path cache"):
+            if is_stop_requested():
+                logger.info("Termination requested; exiting")
+                sys.exit(1)
             if path not in ref_set:
                 logger.info("removing unreferenced file %s", path)
                 Path(path).unlink(missing_ok=True)
+
+    # The path-cache loop above may be empty; never report success after SIGTERM
+    if is_stop_requested():
+        logger.info("Termination requested; exiting")
+        sys.exit(1)
 
     logger.info("Verification finished. Success: %s", success)
 
