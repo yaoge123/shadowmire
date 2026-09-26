@@ -74,12 +74,17 @@ class PackageNotFoundError(Exception):
     pass
 
 
-class ExitProgramException(Exception):
-    pass
+# Raising an exception from the SIGTERM handler is unreliable: the main
+# thread is usually blocked waiting on futures, so the handler may fire
+# late or not at all (in production a SIGTERM'd run kept downloading until
+# SIGKILL, while another ignored TERM for hours). Set a flag instead and
+# let the worker loops exit at the next completed future.
+stop_requested = False
 
 
 def exit_handler(signum: int, frame: Optional[FrameType]) -> None:
-    raise ExitProgramException
+    global stop_requested
+    stop_requested = True
 
 
 signal.signal(signal.SIGTERM, exit_handler)
@@ -89,7 +94,13 @@ def exit_with_futures(futures: dict[Future[Any], Any]) -> NoReturn:
     logger.info("Exiting...")
     for future in futures:
         future.cancel()
-    sys.exit(1)
+    # Downloads are atomic (tmp file + rename) and callers dump local_db state
+    # before getting here, so there is nothing worth waiting for: both the
+    # ThreadPoolExecutor context manager and the interpreter shutdown would
+    # block on non-daemon worker threads until in-flight downloads finish or
+    # time out. Exit immediately instead of risking a SIGKILL later.
+    logging.shutdown()
+    os._exit(1)
 
 
 class LocalVersionKV:
@@ -912,6 +923,8 @@ class SyncBase:
                     total=len(package_names),
                     desc="Checking consistency",
                 ):
+                    if stop_requested:
+                        exit_with_futures(futures)
                     package_name = futures[future]
                     try:
                         consistent = future.result()
@@ -951,6 +964,12 @@ class SyncBase:
                 for future in tqdm(
                     as_completed(futures), total=len(package_names), desc="Updating"
                 ):
+                    if stop_requested:
+                        logger.info(
+                            "Termination requested; saving state and cancelling pending downloads"
+                        )
+                        self.local_db.dump_json()
+                        exit_with_futures(futures)
                     idx, package_name = futures[future]
                     try:
                         serial = future.result()
@@ -966,7 +985,7 @@ class SyncBase:
                     if idx % 100 == 0:
                         logger.info("dumping local db...")
                         self.local_db.dump_json()
-            except (ExitProgramException, KeyboardInterrupt):
+            except KeyboardInterrupt:
                 exit_with_futures(futures)
         return success
 
@@ -979,7 +998,20 @@ class SyncBase:
         to_update = plan.update
 
         for package_name in to_remove:
+            if stop_requested:
+                logger.info(
+                    "Termination requested during removals; saving state and exiting"
+                )
+                self.local_db.dump_json()
+                sys.exit(1)
             self.do_remove(package_name)
+
+        if stop_requested:
+            # Also covers the empty `to_update` case, where parallel_update()
+            # would never enter its loop and the flag would go unnoticed.
+            logger.info("Termination requested; saving state and exiting")
+            self.local_db.dump_json()
+            sys.exit(1)
 
         return self.parallel_update(to_update, file_inclusion_checker)
 
@@ -1629,6 +1661,22 @@ def cli(ctx: click.Context, repo: str) -> None:
     ctx.obj["local_db"] = local_db
 
 
+@cli.result_callback()
+@click.pass_context
+def exit_if_stop_requested(ctx: click.Context, result: Any, **kwargs: Any) -> None:
+    # Command paths without a polling loop (do_update, do_remove,
+    # list_packages_with_serial, clear_invalid_packages) would otherwise
+    # keep running and return success after a SIGTERM.
+    if stop_requested:
+        logger.info("Termination requested; saving state and exiting")
+        local_db = ctx.obj.get("local_db")
+        if local_db is not None:
+            # do_update/do_remove/clear_invalid_packages may already have
+            # committed SQLite changes; keep local.json in sync before exit.
+            local_db.dump_json()
+        sys.exit(1)
+
+
 def compile_regexes(exclude: tuple[str, ...]) -> list[re.Pattern[str]]:
     return [re.compile(i) for i in exclude]
 
@@ -1678,7 +1726,12 @@ def sync(
     with overwrite(basedir / "plan.json") as f:
         json.dump(plan, f, default=vars, indent=2)
     success = syncer.do_sync_plan(plan, file_inclusion_checker)
+    if stop_requested:
+        sys.exit(1)
     syncer.finalize(plan.remote_last_serial)
+    if stop_requested:
+        # SIGTERM arrived while finalize() was writing the indexes
+        sys.exit(1)
 
     logger.info("Synchronization finished. Success: %s", success)
 
@@ -1707,6 +1760,8 @@ def genlocal(ctx: click.Context) -> None:
                 total=len(dir_items),
                 desc="Reading packages from json/",
             ):
+                if stop_requested:
+                    exit_with_futures(futures)
                 package_name = futures[future].name
                 try:
                     serial = future.result()
@@ -1718,11 +1773,15 @@ def genlocal(ctx: click.Context) -> None:
                     logger.warning(
                         "%s generated an exception", package_name, exc_info=True
                     )
-        except (ExitProgramException, KeyboardInterrupt):
+        except KeyboardInterrupt:
             exit_with_futures(futures)
     logger.info(
         "%d out of %d packages have valid serial number", len(local), len(dir_items)
     )
+    if stop_requested:
+        # Do not start the destructive rebuild after a termination request
+        logger.info("Termination requested; exiting")
+        sys.exit(1)
     local_db.nuke(commit=False)
     local_db.batch_set(local)
     local_db.dump_json()
@@ -1768,6 +1827,11 @@ def verify(
         len(local_names),
     )
     for package_name in not_in_local:
+        if stop_requested:
+            # Step 1 removals commit SQLite; keep downstream local.json in sync
+            logger.info("Termination requested; saving state and exiting")
+            local_db.dump_json()
+            sys.exit(1)
         logger.info("package %s not in local db", package_name)
         if remove_not_in_local:
             # Old bandersnatch would download packages without normalization,
@@ -1785,6 +1849,11 @@ def verify(
         len(plan.remove),
     )
     for package_name in plan.remove:
+        if stop_requested:
+            # Step 2 removals commit SQLite; keep downstream local.json in sync
+            logger.info("Termination requested; saving state and exiting")
+            local_db.dump_json()
+            sys.exit(1)
         # We only take the plan.remove part here
         logger.info("package %s not in remote index", package_name)
         syncer.do_remove(package_name, remove_packages=False)
@@ -1816,6 +1885,8 @@ def verify(
         }
         try:
             for future in as_completed(futures):
+                if stop_requested:
+                    exit_with_futures(futures)
                 sname = futures[future]
                 try:
                     for p in future.result():
@@ -1825,7 +1896,7 @@ def verify(
                         raise
                     logger.warning("%s generated an exception", sname, exc_info=True)
                     success = False
-        except (ExitProgramException, KeyboardInterrupt):
+        except KeyboardInterrupt:
             exit_with_futures(futures)
 
     logger.info(
@@ -1875,6 +1946,8 @@ def verify(
                 total=len(simple_dirs),
                 desc="Iterating simple/ directory",
             ):
+                if stop_requested:
+                    exit_with_futures(futures)
                 sname = futures[future]
                 try:
                     nps = future.result()
@@ -1885,14 +1958,22 @@ def verify(
                         raise
                     logger.warning("%s generated an exception", sname, exc_info=True)
                     success = False
-        except (ExitProgramException, KeyboardInterrupt):
+        except KeyboardInterrupt:
             exit_with_futures(futures)
 
         # Part 2: handling packages
         for path in tqdm(packages_pathcache, desc="Iterating path cache"):
+            if stop_requested:
+                logger.info("Termination requested; exiting")
+                sys.exit(1)
             if path not in ref_set:
                 logger.info("removing unreferenced file %s", path)
                 Path(path).unlink(missing_ok=True)
+
+    # The path-cache loop above may be empty; never report success after SIGTERM
+    if stop_requested:
+        logger.info("Termination requested; exiting")
+        sys.exit(1)
 
     logger.info("Verification finished. Success: %s", success)
 
