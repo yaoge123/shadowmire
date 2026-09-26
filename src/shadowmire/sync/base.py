@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import islice
 from os.path import normpath
@@ -22,7 +22,7 @@ from ..constants import (
     WORKERS,
 )
 from ..database import LocalVersionKV
-from ..errors import exit_with_futures, is_stop_requested
+from ..errors import as_completed_with_stop, exit_with_futures, is_stop_requested
 from ..filesystem import (
     MAX_FILENAME_BYTES,
     ignore_unrepresentable_path,
@@ -180,11 +180,8 @@ class SyncBase:
                         ): package_name
                         for package_name in batch
                     }
-                    for future in as_completed(futures):
-                        if is_stop_requested():
-                            # Planning only reads state, so there is nothing
-                            # to dump; cancel the remaining batch and exit.
-                            exit_with_futures(futures)
+                    # Planning only reads state, so there is nothing to dump
+                    for future in as_completed_with_stop(futures):
                         package_name = futures[future]
                         action = future.result()
                         if action == "remove":
@@ -445,15 +442,12 @@ class SyncBase:
                 for package_name in package_names
             }
             try:
+                # verify's steps 1-2 may already have committed removals
                 for future in tqdm(
-                    as_completed(futures),
+                    as_completed_with_stop(futures, on_stop=self.local_db.dump_json),
                     total=len(package_names),
                     desc="Checking consistency",
                 ):
-                    if is_stop_requested():
-                        # verify's steps 1-2 may already have committed removals
-                        self.local_db.dump_json()
-                        exit_with_futures(futures)
                     package_name = futures[future]
                     try:
                         consistent = future.result()
@@ -507,14 +501,10 @@ class SyncBase:
             }
             try:
                 for future in tqdm(
-                    as_completed(futures), total=len(package_names), desc="Updating"
+                    as_completed_with_stop(futures, on_stop=self.local_db.dump_json),
+                    total=len(package_names),
+                    desc="Updating",
                 ):
-                    if is_stop_requested():
-                        logger.info(
-                            "Termination requested; saving state and cancelling pending downloads"
-                        )
-                        self.local_db.dump_json()
-                        exit_with_futures(futures)
                     idx, package_name = futures[future]
                     try:
                         serial = future.result()

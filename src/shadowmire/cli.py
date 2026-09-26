@@ -6,7 +6,7 @@ import signal
 import sys
 import tomllib
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from os.path import normpath
 from pathlib import Path
 from types import FrameType
@@ -19,7 +19,12 @@ from tqdm import tqdm
 from . import __version__
 from .constants import IOWORKERS, LOCAL_DB_NAME, LOCAL_JSON_NAME, WORKERS
 from .database import LocalVersionKV
-from .errors import exit_with_futures, is_stop_requested, request_stop
+from .errors import (
+    as_completed_with_stop,
+    exit_with_futures,
+    is_stop_requested,
+    request_stop,
+)
 from .filesystem import fast_iterdir, fast_readall, overwrite
 from .filters import (
     PACKAGE_FILTER,
@@ -319,12 +324,10 @@ def genlocal(ctx: click.Context) -> None:
         }
         try:
             for future in tqdm(
-                as_completed(futures),
+                as_completed_with_stop(futures),
                 total=len(dir_items),
                 desc="Reading packages from json/",
             ):
-                if is_stop_requested():
-                    exit_with_futures(futures)
                 package_name = futures[future].name
                 try:
                     serial = future.result()
@@ -447,11 +450,8 @@ def verify(
             for idx, first_dir in enumerate(fast_iterdir((basedir / "packages"), "dir"))
         }
         try:
-            for future in as_completed(futures):
-                if is_stop_requested():
-                    # Steps 1-2 may already have committed removals
-                    local_db.dump_json()
-                    exit_with_futures(futures)
+            # Steps 1-2 may already have committed removals, so dump on stop
+            for future in as_completed_with_stop(futures, on_stop=local_db.dump_json):
                 sname = futures[future]
                 try:
                     for p in future.result():
@@ -516,14 +516,10 @@ def verify(
         }
         try:
             for future in tqdm(
-                as_completed(futures),
+                as_completed_with_stop(futures, on_stop=local_db.dump_json),
                 total=len(simple_dirs),
                 desc="Iterating simple/ directory",
             ):
-                if is_stop_requested():
-                    # Steps 1-2 may already have committed removals
-                    local_db.dump_json()
-                    exit_with_futures(futures)
                 sname = futures[future]
                 try:
                     nps = future.result()

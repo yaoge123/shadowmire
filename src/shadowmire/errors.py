@@ -1,6 +1,7 @@
 import logging
 import os
-from concurrent.futures import Future
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future, as_completed
 from typing import Any, NoReturn
 
 logger = logging.getLogger(__name__)
@@ -39,3 +40,21 @@ def exit_with_futures(futures: dict[Future[Any], Any]) -> NoReturn:
     # SIGKILL later.
     logging.shutdown()
     os._exit(1)
+
+
+def as_completed_with_stop(
+    futures: dict[Future[Any], Any], on_stop: Callable[[], Any] | None = None
+) -> Iterator[Future[Any]]:
+    """as_completed() that exits promptly once a stop is requested.
+
+    Polls the stop flag as each future completes. On stop, on_stop runs
+    first (e.g. local_db.dump_json, since earlier steps may already have
+    committed changes), then pending futures are cancelled and the process
+    exits without waiting for in-flight ones (see exit_with_futures).
+    """
+    for future in as_completed(futures):
+        if is_stop_requested():
+            if on_stop is not None:
+                on_stop()
+            exit_with_futures(futures)
+        yield future
